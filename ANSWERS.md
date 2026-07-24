@@ -203,7 +203,7 @@ Future<void> setupLocator() async {
   registerOrganisationsModule(locator);
   registerUsersModule(locator);
 }
-```
+````
 
 ---
 
@@ -211,27 +211,72 @@ Future<void> setupLocator() async {
 
 ### 3.1 - Cubit vs BLoC vs Riverpod
 
+**Advantages in this codebase.** `NotificationsCubit` exposes intent-named methods (`start`, `onAppResumed`, `onAppPaused`, `markAsRead`) — the polling/retry machinery stays private and the page reads declaratively. No event classes, no `mapEventToState` ceremony: for ~15 state transitions in this app that is real velocity. `bloc_test` still works (`test/notifications_cubit_test.dart` tests method-call behaviour directly), and Cubit keeps the MVVM shape from Part 0 familiar to newcomers.
+
+**Disadvantages.** There is no event log: when the "3 consecutive failed cycles" bug would occur in production, `BlocObserver` shows *state* transitions but not *which caller* (timer vs `onAppResumed` vs `markAsRead`) triggered the failing cycle — with BLoC events, the cause is serialized in the stream. Cubit also allows unstructured call order: nothing stops a widget from calling `start()` twice or `markAsRead` while closed (my implementation guards with `_isPolling`/`isClosed`, but that discipline is manual, not enforced by the framework). Riverpod's compile-safe graph and auto-dispose would remove the GetIt/lifecycle questions entirely (see 3.4), at the cost of a different mental model and losing `BlocObserver`/`BlocListener` ergonomics.
+
+**When to migrate to BLoC.** When the *same* state machine gets many entry points or needs event-level traceability — e.g. if notifications gain "user swiped to dismiss", "push arrived", "deep link opened" alongside the timer, a `NotificationsEvent` hierarchy (`PollRequested`, `AppResumed`, `Dismissed`) makes the stream self-documenting and lets `BlocObserver` audit every transition. Also when you need event transformers (`restartable`, `debounceTime`) — the search field in `UserListCubit` is exactly the case: today debounce is hand-rolled with a `Timer`; a BLoC `SearchTermChanged` event with a `restartable` transformer is shorter and race-free.
+
+**When overkill.** This app: three features, each with one primary state machine and <5 public intents. Events would double the type count of `NotificationsCubit` without changing any behaviour the assessment asks for. I would migrate per-feature, only when the trigger list or audit requirements grow — not wholesale.
+
 ### 3.2 - Centralised locator
+
+A single `locator.dart` registering everything breaks down in predictable ways as the project grows:
+
+- **Merge-conflict magnet**: every feature PR touches the same file; with 20 features, registration order becomes a negotiation instead of a decision.
+- **Hidden coupling & cycles**: nothing stops a module from resolving another feature's concrete type (e.g. `OrganisationsModule` grabbing `NotificationsApiImpl`), silently bypassing the domain port — the exact break 3.6 warns about, and invisible in code review inside a 500-line file.
+- **Lifecycle opacity**: which registrations are user-scoped (must die at logout) vs app-scoped (survive)? In one file this is tribal knowledge; the 3.4 bug (previous user's data) lives precisely in that ambiguity.
+- **Test friction**: booting the locator for a unit test means registering the world, or copy-pasting subsets that drift from production.
+
+**How I organise it (already applied in `lib/app/di/`)**: one module per feature (`notifications_module.dart`, `users_module.dart`, …) plus a `core_module.dart` for shared infra; `locator.dart` only *composes* modules in dependency order (`await registerCoreModule` first, since `RemoteApiClient` needs `AuthService`/`SessionCoordinator`). Each module is the only place allowed to import that feature's `data/` implementations — the composition root owns the impl↔port wiring, so cross-feature concrete imports get one obvious home to audit. For session-scoped dependencies I'd go one step further with GetIt's `pushScope('session')` on login and `popScope` on logout, so user data is destroyed by construction rather than by remembering to reset it (see 3.4).
 
 ### 3.3 - Offline operations queue
 
+**Architecture (no code), mapped onto Part 0's layers:**
+
+1. **Domain**: a `PendingOperation` entity (id, feature, payload as JSON, created-at, retry count) and a `SyncQueue` port (`enqueue`, `pending`, `markDone`, `markFailed`). No Flutter, no sqflite.
+2. **Data**: `SyncQueueImpl` backed by sqflite (durable across restarts — the queue must survive process death, otherwise offline edits are lost on crash). The existing feature services change their failure path: instead of throwing on network error, they *enqueue* the operation and return a locally-consistent result (optimistic write), so `OrganisationsCubit` keeps working unchanged — the queue is invisible to presentation.
+3. **Sync engine** (app/core level): a `SyncCoordinator` listening to connectivity + app-foreground events (same lifecycle seam `NotificationsCubit.onAppResumed` already uses). On connectivity restore: drain the queue FIFO per feature, replaying each operation against the same domain port the live path uses (`OrganisationsApi.createOrganisation`, …), with the same backoff discipline as `NotificationsCubit` (1s/2s/4s) and `HttpRateLimitInterceptor` (respect `Retry-After` so a synced burst doesn't re-trigger 429s).
+4. **Conflict policy**: server-wins on read-after-sync (pull refresh after drain, like the cubit's `markAsRead` → `_runCycle` pattern); for conflicting edits, last-writer-wins with `createdAt` timestamps, surfaced to the user only when data would be silently lost.
+5. **Failure handling**: `markFailed` increments retry count; after N attempts the operation is parked and surfaced as an error state in the owning feature (the `NotificationsError`-with-previous-data pattern — keep showing data, show a banner).
+
+Key point: presentation never knows the queue exists. All seams are the already-declared domain ports — this is what Part 0's architecture buys.
+
 ### 3.4 - Previous user data bug
+
+**Root cause hypothesis (primary).** Nothing in the logout path tears down user-scoped state held *outside the widget tree*. Concretely in this repo: `AuthService` is a `registerLazySingleton` (`core_module.dart`), so its session/token fields survive logout unless explicitly cleared; feature cubits are `registerFactory` (e.g. `notifications_module.dart`), but `NotificationsCubit` keeps polling via its `_pollTimer` — if the instance isn't closed at logout, a `_runCycle` fired *before* user B's login can emit `NotificationsLoaded` with user A's data into a widget tree now owned by user B. The Part 1 `HttpErrorInterceptor` makes it worse: its fire-and-forget `logout(); replace(LoginRoute())` means navigation races the async logout — the login screen appears *before* the session is actually cleared, so B's first authenticated requests can even carry A's token.
+
+**How I would investigate.**
+
+1. Reproduce with logging: log `AuthService` identity (`hashCode`) and token at logout and at B's first request — if the singleton identity survives, scope leak confirmed.
+2. Instrument `BlocObserver.onChange/onClose` around logout: any feature cubit emitting after logout, or never closed, is a leak (expected: `NotificationsCubit` still ticking its timer).
+3. Check the race: add a timestamp to the interceptor's 401 callback vs `logout()` completion — if navigation precedes completion, the fire-and-forget ordering bug from 1.2 is confirmed as the enabler.
+
+**Fix direction.** Make logout atomic and single-flight (the `SessionCoordinator` already in `core/`): cancel feature cubits/timers, clear `AuthService` state, then `pushScope`/`popScope` (or targeted `unregister`) in GetIt for user-scoped registrations, and only then navigate — so by construction no user-A instance exists when B logs in.
 
 ### 3.5 - SOLID principles in practice
 
-<!-- Principle 1: name, file, violation, consequence, refactor -->
+**Principle 1 — Dependency Inversion Principle.** Violation: `part1_diagnosis/organisation_service.dart` — `OrganisationService` (high-level domain policy) depends on `OrganisationsCubit` (low-level presentation detail), instead of both depending on abstractions. Consequence in a growing team: the feature team can't change the cubit's API (split it, rename methods, move to BLoC) without editing domain code, and the service can't be reused by a sync job or test without importing `flutter_bloc` — every presentation refactor becomes a cross-layer PR. Refactor: service depends only on the `OrganisationsApi` port and returns values; the cubit subscribes/calls and owns its own state (exactly the 1.3 refactor).
 
-<!-- Principle 2: name, file, violation, consequence, refactor -->
+**Principle 2 — Single Responsibility Principle.** Violation: `part1_diagnosis/http_error_interceptor.dart` registration block — one interceptor callback simultaneously owns transport detection (status matching), session policy (`logout()`), and navigation (`replace(LoginRoute())` / `push(ForbiddenRoute())`). Three reasons to change means three teams editing the same callback; that is how the 1.2 concurrency storm shipped — coordinating logout-once was nobody's single responsibility. Refactor: interceptor = detection only, emits a signal; `SessionCoordinator` = session policy (single-flight); app shell/router = navigation reaction. Each has one reason to change, and the 401-storm fix lands in exactly one place.
 
 ### 3.6 - Dependency direction in this project
 
-<!-- Describe expected dependency direction, a concrete break scenario, and how to enforce boundaries -->
+**Expected direction** (per Part 0): `NotificationsPage` → `NotificationsCubit` → `NotificationsApi` (domain port) ← `NotificationsApiImpl`. The page knows the cubit; the cubit knows only the abstraction; the impl points *at* the port (implements it); nothing outside `app/di` names the impl. The only file allowed to see both sides is `notifications_module.dart`.
+
+**Concrete break.** If `NotificationsCubit` imported `NotificationsApiImpl` directly: presentation now depends on data. The cubit is welded to one transport — `NotificationsApiImpl` here is the in-memory demo with `failTimes`, so *production polling behaviour would be defined by demo code*; swapping in the real HTTP impl means editing the cubit, and the unit test (`_MockNotificationsApi extends Mock implements NotificationsApi`) becomes impossible — you can't mock a concrete class your cubit news-up or type-depends on. The DI registration `registerFactory<NotificationsCubit>(() => NotificationsCubit(getIt<NotificationsApi>()))` also silently stops being the real wiring.
+
+**Enforcement.** (1) Structural: port in `domain/`, impl in `data/` — the import path itself signals direction. (2) DI: register only `NotificationsApi` → impl in the feature module; cubit factories resolve the port. (3) Tooling: a custom lint/import-rule (or `import_sayer`/arch_test) failing CI on `presentation` importing `data/` or `*_impl.dart`; the `rules/dependencies.md` checklist in this repo states the same rule for agentic contributors. (4) Review norm: constructor parameters typed as abstractions is a one-line check.
+
+**Practical effect on testability/change cost.** With the port respected, `test/notifications_cubit_test.dart` needs zero HTTP — `when(() => api.getUnreadNotifications()).thenAnswer(...)` covers success and failure sequencing (the 3-failed-cycles path) in milliseconds, and replacing the transport (mock → HTTP → cached) is a one-line module change. With the concrete import, every cubit test pays for an HTTP fake, and every transport change is a presentation change.
 
 ### 3.7 - Architecture under growth
 
-<!-- Firebase push notifications - layers touched: -->
+**Firebase push notifications — layers touched:** Data (new `PushService` in `core/` or a `push` feature wrapping FCM token + foreground message stream) and App (`core_module` registration, notification-tap routing in `app/router`). Domain gains nothing unless we add "register device token with backend" (then one method on a port). Presentation: `NotificationsCubit` gains one trigger — a push message calls the existing `_runCycle()` refresh path. **No existing layer changes shape**: push is just a new reason to call the already-injected port.
 
-<!-- Offline-first organisation list - layers touched: -->
+**Offline-first organisation list — layers touched:** Data only, behind the existing port: a cached `OrganisationsApi`/repository that reads sqflite first, refreshes in background, and queues writes (the 3.3 queue). `OrganisationsApi` port unchanged; `OrganisationService` and `OrganisationsCubit` untouched — offline behaviour is transparent below the port. Optionally the domain *adds* `watchOrganisations()` for live cache updates (additive; the cubit then subscribes instead of one-shot fetch). The whole change is one DI registration swap — exactly the port's purpose.
 
-<!-- Global theme switcher - layers touched: -->
-````
+**Global theme switcher — layers touched:** App + Presentation (app-level `ThemeCubit` provided above `MaterialApp`, mapping `light/dark/system` to `ThemeMode`), plus a thin Data slice (persist the choice in shared_preferences behind a `SettingsRepository` port in a small `settings` feature). Feature code changes: zero — every screen already reads `Theme.of(context)`; MaterialApp reacts to the cubit. No domain, network, or existing feature file is reopened.
+
+All three growth items land as **new modules or data-slices behind ports**, not edits rippling through existing layers — which is the scalability claim of Part 0 being paid out.
+
