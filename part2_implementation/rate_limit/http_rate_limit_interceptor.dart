@@ -1,4 +1,3 @@
-// ignore_for_file: unused_import
 import 'interceptor_contract.dart';
 
 // Exception to be thrown after exceeding the resend limit
@@ -10,15 +9,92 @@ class RateLimitExceededException implements Exception {
   String toString() => 'RateLimitExceededException: $message';
 }
 
-// TODO: implement HttpRateLimitInterceptor here
-//
-// Expected signature:
-//
-// class HttpRateLimitInterceptor extends InterceptorContract {
-//   /// Executes the HTTP request. Inject this function to allow testing
-//   /// without depending on a real HTTP client.
-//   final Future<ResponseData> Function(BaseRequest request) executeRequest;
-//
-//   HttpRateLimitInterceptor({required this.executeRequest});
-//   ...
-// }
+/// Handles 429 Too Many Requests responses.
+///
+/// Reads the `Retry-After` header (seconds), waits, and automatically resends
+/// the original request. After [HttpRateLimitInterceptor._maxResends] resends
+/// it throws [RateLimitExceededException].
+class HttpRateLimitInterceptor extends InterceptorContract {
+  /// Executes the HTTP request. Inject this function to allow testing
+  /// without depending on a real HTTP client.
+  final Future<ResponseData> Function(BaseRequest request) executeRequest;
+
+  static const _maxResends = 2;
+  static const _retryAfterHeader = 'Retry-After';
+
+  BaseRequest? _currentRequest;
+  int _resendCount = 0;
+  bool _isResending = false;
+
+  HttpRateLimitInterceptor({required this.executeRequest});
+
+  @override
+  Future<BaseRequest> interceptRequest({required BaseRequest request}) async {
+    // Resent requests pass through without resetting the tracked original.
+    if (!_isResending) {
+      _currentRequest = request;
+      _resendCount = 0;
+    }
+    return request;
+  }
+
+  @override
+  Future<ResponseData> interceptResponse({
+    required ResponseData response,
+  }) async {
+    if (response.statusCode != 429) {
+      return response;
+    }
+
+    // Responses of resent requests are handled inside [_handleRateLimit].
+    if (_isResending) {
+      return response;
+    }
+
+    return _handleRateLimit(response);
+  }
+
+  Future<ResponseData> _handleRateLimit(ResponseData response) async {
+    final request = _currentRequest;
+    if (request == null) {
+      throw const RateLimitExceededException(
+        'Received 429 but no original request is available to resend.',
+      );
+    }
+
+    var current = response;
+
+    while (current.statusCode == 429) {
+      if (_resendCount >= _maxResends) {
+        throw const RateLimitExceededException(
+          'Rate limit exceeded: maximum of 2 automatic resends reached.',
+        );
+      }
+
+      final retryAfterSeconds = _readRetryAfterSeconds(current.headers);
+      await Future<void>.delayed(Duration(seconds: retryAfterSeconds));
+
+      _resendCount++;
+      _isResending = true;
+      try {
+        current = await executeRequest(request);
+      } finally {
+        _isResending = false;
+      }
+    }
+
+    return current;
+  }
+
+  int _readRetryAfterSeconds(Map<String, String> headers) {
+    final normalized = <String, String>{
+      for (final entry in headers.entries) entry.key.toLowerCase(): entry.value,
+    };
+    final raw = normalized[_retryAfterHeader.toLowerCase()];
+    final seconds = int.tryParse(raw ?? '');
+    if (seconds == null || seconds < 0) {
+      return 0;
+    }
+    return seconds;
+  }
+}
